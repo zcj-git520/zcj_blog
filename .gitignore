@@ -4,6 +4,11 @@ docs/public*
 *.prof
 nohup.out
 cover.out
+src/hugo
+zcj_blog/themes
+zcj_blog/themes/Vno-Hugo
+zcj_blog/themes/hugo-minimalist-theme
+zcj_blog/themes/hugo-theme-stack
 *.swp
 *.swo
 .DS_Store
