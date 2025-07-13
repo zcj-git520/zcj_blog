@@ -1,5 +1,5 @@
 ---
-title: "go 基础之切片"
+title: "go 切片的深入理解"
 date: 2021-09-15T22:00:38+08:00
 draft: false
 image: s4.png

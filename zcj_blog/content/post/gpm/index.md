@@ -1,5 +1,5 @@
 ---
-title: "go goroutine与gmp模型"
+title: "go goroutine与gmp模型的深入理解"
 date: 2021-10-06T22:00:38+08:00
 draft: true
 image: 1.png
@@ -460,7 +460,341 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 6. 如果当前有空闲的P,没有睡眠的M,并且主协程开始运行时，就会创建新的活跃的M
 7. 当g运行结束后，设置允许当前m被抢占
 
+## goroutine的让出与恢复、调度、抢占、监控
+### goroutine 让出与恢复
+* 协程的让出是由函数gopark()执行的
+```
+源码如下：
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, traceEv byte, traceskip int) {
+	if reason != waitReasonSleep {
+		checkTimeouts() // timeouts may expire while two goroutines keep the scheduler busy
+	}
+    // 禁止当前m被抢占
+	mp := acquirem()
+	gp := mp.curg
+	status := readgstatus(gp)
+    // 判断协程的是否在运行状态
+	if status != _Grunning && status != _Gscanrunning {
+		throw("gopark: bad g status")
+	}
+	mp.waitlock = lock
+	mp.waitunlockf = unlockf
+	gp.waitreason = reason
+	mp.waittraceev = traceEv
+	mp.waittraceskip = traceskip
+    // 解除对m的抢占
+	releasem(mp)
+	// can't do anything that might move the G between Ms here.
+    // 不能做任何可能在 Ms 之间移动 G 的事情。
+    // 保存协程，切换在go
+	mcall(park_m)
+}
+func park_m(gp *g) {
+	_g_ := getg()
 
+	if trace.enabled {
+		traceGoPark(_g_.m.waittraceev, _g_.m.waittraceskip)
+	}
+    //更改协程由运行状态到等待状态
+	casgstatus(gp, _Grunning, _Gwaiting)
+	dropg()
+    """
+    func dropg() {
+    	_g_ := getg()
+        // 把m当前执行的置为nil(m不在运行这个当前写协程，协程就挂起了)
+    	setMNoWB(&_g_.m.curg.m, nil)
+    	setGNoWB(&_g_.m.curg, nil)
+    }
+    """
+
+	if fn := _g_.m.waitunlockf; fn != nil {
+		ok := fn(gp, _g_.m.waitlock)
+		_g_.m.waitunlockf = nil
+		_g_.m.waitlock = nil
+		if !ok {
+			if trace.enabled {
+				traceGoUnpark(gp, 2)
+			}
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			execute(gp, true) // Schedule it back, never returns.
+		}
+	}
+	schedule() // 寻找下一个G
+}
+//在G中由定时调用回调函数f 
+type timer struct {
+	// If this timer is on a heap, which P's heap it is on.
+	// puintptr rather than *p to match uintptr in the versions
+	// of this struct defined in other packages.
+	pp puintptr
+
+	// Timer wakes up at when, and then at when+period, ... (period > 0 only)
+	// each time calling f(arg, now) in the timer goroutine, so f must be
+	// a well-behaved function and not block.
+	//
+	// when must be positive on an active timer.
+	when   int64
+	period int64
+	f      func(interface{}, uintptr)
+	arg    interface{}
+	seq    uintptr
+
+	// What to set the when field to in timerModifiedXX status.
+	nextwhen int64
+
+	// The status field holds one of the values below.
+	status uint32
+}
+// Mark gp ready to run.
+// 将等待协程状态置为运行的状态
+func ready(gp *g, traceskip int, next bool) {
+	if trace.enabled {
+		traceGoUnpark(gp, traceskip)
+	}
+
+	status := readgstatus(gp)
+
+	// Mark runnable.
+	_g_ := getg()
+    //// 禁止当前m被抢占
+	mp := acquirem() // disable preemption because it can be holding p in a local var
+	if status&^_Gscan != _Gwaiting {
+		dumpgstatus(gp)
+		throw("bad g->status in ready")
+	}
+
+	// status is Gwaiting or Gscanwaiting, make Grunnable and put on runq
+	casgstatus(gp, _Gwaiting, _Grunnable) // 把协程等待的转态置为可运行状态
+	runqput(_g_.m.p.ptr(), gp, next)  // 添加在运行队列中
+	wakep()// 如果没有可执行的M,就创建新的m
+	releasem(mp)  // 释放当前的m
+}
+```  
+如图所示  ![](4.png)
+* 总结
+1.  gopark()是让出函数，禁止当前m被抢占，判断当前的协程状态是否为运行状态。
+2. dropg()让当前的m不在执行当前的G,修改当前g的状态为等待(协程挂起)，调用schedule() 寻找下一个可执行G
+3. timers 等待的g中数据结构，定时调用回调函数f，将g置为了运行状态
+3. ready()函数是将唤醒等待G,将G的状态更改为可运行状态，并添加在运行的队列中m，如果没有可执行的M,就创建新的m
+### goroutine 监控
+* 使用checkTimers()检查到时间运行的唤醒g
+```
+源码如下
+checkTimers(pp *p, now int64) (rnow, pollUntil int64, ran bool) {
+  	// If it's not yet time for the first timer, or the first adjusted
+  	// timer, then there is nothing to do.
+  	next := int64(atomic.Load64(&pp.timer0When))
+  	nextAdj := int64(atomic.Load64(&pp.timerModifiedEarliest))
+  	if next == 0 || (nextAdj != 0 && nextAdj < next) {
+  		next = nextAdj
+  	}
+  
+  	if next == 0 {
+  		// No timers to run or adjust.
+  		return now, 0, false
+  	}
+  
+  	if now == 0 {
+  		now = nanotime()
+  	}
+  	if now < next {
+  		// Next timer is not ready to run, but keep going
+  		// if we would clear deleted timers.
+  		// This corresponds to the condition below where
+  		// we decide whether to call clearDeletedTimers.
+  		if pp != getg().m.p.ptr() || int(atomic.Load(&pp.deletedTimers)) <= int(atomic.Load(&pp.numTimers)/4) {
+  			return now, next, false
+  		}
+  	}
+  
+  	lock(&pp.timersLock)
+  
+  	if len(pp.timers) > 0 {
+  		adjusttimers(pp, now)
+  		for len(pp.timers) > 0 {
+  			// Note that runtimer may temporarily unlock
+  			// pp.timersLock.
+  			if tw := runtimer(pp, now); tw != 0 {
+  				if tw > 0 {
+  					pollUntil = tw
+  				}
+  				break
+  			}
+  			ran = true
+  		}
+  	}
+  
+  	// If this is the local P, and there are a lot of deleted timers,
+  	// clear them out. We only do this for the local P to reduce
+  	// lock contention on timersLock.
+  	if pp == getg().m.p.ptr() && int(atomic.Load(&pp.deletedTimers)) > len(pp.timers)/4 {
+  		clearDeletedTimers(pp)
+  	}
+  
+  	unlock(&pp.timersLock)
+  
+  	return now, pollUntil, ran
+  }
+```
+* 协程的监控是由专门的监控协程程来运行，监控协程是由主协程创建而来
+，监控协程与gpm中的协程不一样，它不是由gpm进行调度，当然了也不需要P,
+监控timer，并按需调整g的休眠时间，如果没有可执行的M,就创建新的m执行被唤醒的G,
+确保被唤醒g被执行。
+如图  ![](5.png)
+
+### goroutine 抢占
+* 对运行过长的g进行抢占，即当g运行时间超过运行阈值的g强制让出m
+运行时间是由P的结构syscalltick、schedtick、timer0When等记录。
+* 通过栈增长时：当stackguard = stackPreempt,不执行栈增长，而是执行协程调度,
+这样就让协程让出栈。
+* 这种抢占依赖栈增长，有缺陷。所以有asyncPreempt通过信号方式进行异步抢占  
+如图所示  ![](6.png)
+
+### goroutine 调度
+* 调用schedule()函数进行协程的调度
+```
+源码如下：
+func schedule() {
+	_g_ := getg() // 获得当前的G
+
+	if _g_.m.locks != 0 {
+		throw("schedule: holding locks")
+	}
+    // 判断当前的M和当前的G是否绑定
+	if _g_.m.lockedg != 0 {
+        // 如果当前的M绑定G,就阻塞m(休眠M)
+		stoplockedm()
+		execute(_g_.m.lockedg.ptr(), false) // Never returns.
+	}
+
+	// We should not schedule away from a g that is executing a cgo call,
+	// since the cgo call is using the m's g0 stack.
+	if _g_.m.incgo {
+		throw("schedule: in cgo")
+	}
+
+top:
+	pp := _g_.m.p.ptr()
+	pp.preempt = false
+    // 判断Gc是否在等待执行
+	if sched.gcwaiting != 0 {
+        //是在等待执行，先执行gc，执行完在执行后续操作
+		gcstopm() 
+		goto top
+	}
+	if pp.runSafePointFn != 0 {
+		runSafePointFn()
+	}
+
+	// Sanity check: if we are spinning, the run queue should be empty.
+	// Check this before calling checkTimers, as that might call
+	// goready to put a ready goroutine on the local run queue.
+	if _g_.m.spinning && (pp.runnext != 0 || pp.runqhead != pp.runqtail) {
+		throw("schedule: spinning with local work")
+	}
+    //检查是否有要被执行的Timer
+	checkTimers(pp, 0)
+
+	var gp *g
+	var inheritTime bool
+
+	// Normal goroutines will check for need to wakeP in ready,
+	// but GCworkers and tracereaders will not, so the check must
+	// be done here instead.
+    // 普通的 goroutine 会检查是否需要在准备好时唤醒， 
+    // 但 GCworkers 和跟踪读取器不会，所以检查必须 
+    // 在这里完成。
+	tryWakeP := false
+	if trace.enabled || trace.shutdown {
+		gp = traceReader()
+		if gp != nil {
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			traceGoUnpark(gp, 0)
+			tryWakeP = true
+		}
+	}
+	if gp == nil && gcBlackenEnabled != 0 {
+		gp = gcController.findRunnableGCWorker(_g_.m.p.ptr())
+		tryWakeP = tryWakeP || gp != nil
+	}
+	if gp == nil {
+		// Check the global runnable queue once in a while to ensure fairness.
+		// Otherwise two goroutines can completely occupy the local runqueue
+		// by constantly respawning each other.
+        / 每隔一段时间检查一下全局可运行队列以确保公平。 
+        // 否则两个 goroutine 可以完全占用本地运行队列
+        // 通过不断相互重生。
+        // 有%61的概率把G从全局运行队列中搬移到本地可运行队列，保障本地可运行队列
+            有G运行，全局队列也能放在本都队列中
+		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
+			lock(&sched.lock)
+			gp = globrunqget(_g_.m.p.ptr(), 1)
+			unlock(&sched.lock)
+		}
+	}
+	if gp == nil {
+        // 没有待运行的G 就现在本地可运行队列查找
+		gp, inheritTime = runqget(_g_.m.p.ptr())
+		// We can see gp != nil here even if the M is spinning,
+		// if checkTimers added a local goroutine via goready.
+	}
+	if gp == nil {
+        // 本地队列没有，就调用findrunnable()，直到有待执行的g才返回(先在本地
+            运行队列，全局队列、等待的io, 其他的P)
+		gp, inheritTime = findrunnable() // blocks until work is available
+	}
+
+	// This thread is going to run a goroutine and is not spinning anymore,
+	// so if it was marked as spinning we need to reset it now and potentially
+	// start a new spinning M.
+	if _g_.m.spinning {
+		resetspinning()
+	}
+
+	if sched.disable.user && !schedEnabled(gp) {
+		// Scheduling of this goroutine is disabled. Put it on
+		// the list of pending runnable goroutines for when we
+		// re-enable user scheduling and look again.
+		lock(&sched.lock)
+		if schedEnabled(gp) {
+			// Something re-enabled scheduling while we
+			// were acquiring the lock.
+			unlock(&sched.lock)
+		} else {
+			sched.disable.runnable.pushBack(gp)
+			sched.disable.n++
+			unlock(&sched.lock)
+			goto top
+		}
+	}
+
+	// If about to schedule a not-normal goroutine (a GCworker or tracereader),
+	// wake a P if there is one.
+	if tryWakeP {
+		wakep()
+	}
+    // 判断获得的G有没有绑定的M,有就阻塞g, 再次进行调度
+	if gp.lockedm != 0 {
+		// Hands off own p to the locked m,
+		// then blocks waiting for a new p.
+		startlockedm(gp)
+		goto top
+	}
+    // 使用execute函数让m执行g
+	execute(gp, inheritTime)
+}
+```  
+如图所示  ![](7.png)
+* 总结
+1. 判断当前的M和当前的G是否绑定，如果当前的M绑定G,就阻塞m(休眠M)
+2. 判断Gc是否在等待执行，是在等待执行，先执行gc，执行完在执行后续操作
+3. 检查是否有要被执行的Timer
+4. 普通的 goroutine 会检查是否需要在准备好时唤醒，但 GCworkers 和跟踪读取器不会，所以检查必须 
+5. 有%61的概率把G从全局运行队列中搬移到本地可运行队列，保障本地可运行队列有G运行，全局队列也能放在本都队列中
+6. 没有待运行的G就现在本地可运行队列查找，本地队列没有，就调用findrunnable()，直到有待执行的g才返回(先在本地
+ 运行队列，全局队列、等待的io, 其他的P中分配G)  
+7. 判断获得的G有没有绑定的M,有就阻塞g, 再次进行调度
+8. 使用execute函数让m执行g,待运行g绑定m,调用gogo(&gp.sched)协程的现场恢复等
 ## 调度器的设计策略
 * 减少线程的创建与销毁cup的开销，GPM是线程的复用。即当没有 可运行的G时，将M休眠,P空闲。当有可执行G是找空闲的P，在将M唤醒，执行G，直到 main.main 退出，runtime.main 执行 Defer 和 Panic 处理，或调用 runtime.exit 退出程序
 * work stealing 机制：当本线程无可运行的 G 时，尝试从其他线程绑定的 P 偷取 G，而不是销毁线程。
