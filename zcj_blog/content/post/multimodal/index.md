@@ -32,21 +32,80 @@ categories:
 ```python
 from langchain_core.messages import HumanMessage
 
-message = HumanMessage(
-    content=[
-        {"type": "text", "text": "分析这张图片中的场景："},
-        {
-            "type": "image_url",
-            "image_url": {"url": "https://example.com/scene.jpg"},
-        },
-    ]
-)
+ message = HumanMessage(
+                content=json.dumps([
+                    {"type": "text", "text": prompt_txt},
+                    {"type": type, "data": image_data, "source_type": "base64"},
+                ])
+            )
 ```
 
-### 2.3 输出处理方案
+# 代码示例
 
-- **图像生成**：通过Gemini等模型直接输出图片
-- **音频生成**：使用OpenAI的TTS接口
-- **混合输出**：文本+多媒体组合响应
+```python
+# 多模态输入
+import base64
+import json
 
-## 
+from langchain_core.messages import HumanMessage
+
+from common.modeCommon import Model
+from config.config import Config
+from utils import images_util
+
+
+class Multimodal(object):
+    def __init__(self, model: Model):
+        self.model = model
+
+    def input_by_base64(self, prompt_txt, image_data, type):
+        try:
+
+            message = HumanMessage(
+                content=json.dumps([
+                    {"type": "text", "text": prompt_txt},
+                    {"type": type, "data": image_data, "source_type": "base64"},
+                ])
+            )
+
+            china = self.model.qwen_llm()
+            return china.invoke([message]).content
+        except Exception as e:
+            print(e)
+            return ""
+
+    def input_by_url(self, prompt_txt, url, type):
+
+        try:
+            message = HumanMessage(
+                content=json.dumps([
+                    {"type": "text", "text": prompt_txt},
+                    {"type": type, "data": url, "source_type": "url"},
+                ])
+            )
+            china = self.model.qwen_llm()
+            return china.invoke([message]).content
+        except Exception as e:
+            print(e)
+            return ""
+
+if __name__ == '__main__':
+    config = Config('conf/config.yml')
+    # 初始化模型
+    model = Model(config)
+    multimodal = Multimodal(model)
+    # image_path = "C:\\Users\\Administrator\\Desktop\\17536735231103.png"
+    # base64_code = images_util.image_to_base64_by_local(image_path)
+
+    # result = multimodal.input_by_image_base64("这张图片描述了什么,中文描述", base64_code, "image/png")
+    # result = multimodal.input_by_url("这张图片描述了什么,中文描述", "https://img.shetu66.com/2023/04/25/1682391094827084.png", "image")
+    file_path = "C:\\Users\\Administrator\\Desktop\\1.pdf"
+    base64_file = images_util.file_to_base64_by_local(file_path)
+    result = multimodal.input_by_base64("文件主要讲了什么", base64_file, "file")
+    print(result)
+
+```
+
+## 代码仓库路径
+
+[zcj-git520/AiLargeModel: 大模型应用开发学习](https://github.com/zcj-git520/AiLargeModel)
