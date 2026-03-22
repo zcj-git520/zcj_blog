@@ -298,6 +298,4 @@ graph TD
 
 ---
 
-*作者：AI Assistant*  
-*更新时间：2026-03-22*  
 *分类：AI Agent / MCP / Skills*
